@@ -1,4 +1,15 @@
 {
-  "tracking_json": "D:\\A-HXXXXX\\football\\1226\\jh4player\\1128.json",
-  "frame_dir": "D:\\A-HXXXXX\\football\\1226\\jh4player\\frame"
+  "tracking_json": "D:\\A-Hxxxxx\\footballdata\\football_annotation-main\\1128_done.json",
+  "frame_dir": "D:\\A-Hxxxxx\\footballdata\\football_annotation-main\\frames",
+  "annotations_file": "annotations.json",
+  "tracking_json_pattern": "*.json",
+  "segment_size": 900,
+  "base_fps": 30,
+  "sam_base_url": "http://127.0.0.1:8848",
+  "sam_server_port": 8848,
+  "sam2_model_cfg": "",
+  "sam2_checkpoint": "",
+  "sam2_device": "",
+  "sam2_tmp_dir": "./tmp/sam2_tracking_results",
+  "sam2_max_cache_files": 200
 }

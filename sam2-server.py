@@ -133,14 +133,16 @@ def convert_keys_for_json(obj):
         return obj
 
 # 新增：缓存管理函数
-def manage_cache(tmp_dir: str, max_files: int = 200) -> None:
+def manage_cache(tmp_dir: str, max_files: int | None = None) -> None:
     """
     管理临时文件夹中的文件，删除超过最大数量的旧文件
     
     参数:
         tmp_dir: 临时文件夹路径
-        max_files: 最大文件数量限制
+        max_files: 最大文件数量限制，如果不指定则使用配置中的值
     """
+    if max_files is None:
+        max_files = MAX_CACHE_FILES
     # 确保临时文件夹存在
     os.makedirs(tmp_dir, exist_ok=True)
     
@@ -168,7 +170,22 @@ app = FastAPI(title="SAM2视频目标跟踪服务")
 
 # 全局变量用于存储跟踪器实例
 STATE: _ServiceState | None = None
-TMP_DIR = "./tmp/sam2_tracking_results"
+
+# 配置文件路径和配置
+_SETTINGS_PATH = _ROOT / "jh4player_settings.json"
+
+def _load_settings() -> dict:
+    """从配置文件加载设置"""
+    if _SETTINGS_PATH.exists():
+        try:
+            return json.loads(_SETTINGS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+_CONFIG = _load_settings()
+TMP_DIR = _CONFIG.get("sam2_tmp_dir", "./tmp/sam2_tracking_results")
+MAX_CACHE_FILES = int(_CONFIG.get("sam2_max_cache_files", 200))
 
 
 def _safe_int(v: Any, *, name: str) -> int:
@@ -211,9 +228,10 @@ async def startup_event():
     default_model_cfg = _SAM2_MAIN / "sam2" / "configs" / "sam2.1" / "sam2.1_hiera_s.yaml"
     default_checkpoint = _SAM2_MAIN / "checkpoints" / "sam2.1_hiera_small.pt"
 
-    model_cfg = os.environ.get("SAM2_MODEL_CFG") or str(default_model_cfg)
-    checkpoint_path = os.environ.get("SAM2_CHECKPOINT") or str(default_checkpoint)
-    device = os.environ.get("SAM2_DEVICE")
+    # 优先从配置文件读取，其次从环境变量读取，最后使用默认值
+    model_cfg = _CONFIG.get("sam2_model_cfg") or os.environ.get("SAM2_MODEL_CFG") or str(default_model_cfg)
+    checkpoint_path = _CONFIG.get("sam2_checkpoint") or os.environ.get("SAM2_CHECKPOINT") or str(default_checkpoint)
+    device = _CONFIG.get("sam2_device") or os.environ.get("SAM2_DEVICE")
 
     # Optional: reset compilation caches for a clean run (best-effort).
     try:
@@ -444,6 +462,8 @@ async def shutdown_event():
     print("SAM2服务已关闭")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8848)
+    # 从配置文件读取端口，默认 8848
+    port = int(_CONFIG.get("sam_server_port", 8848))
+    uvicorn.run(app, host="127.0.0.1", port=port)
 
 #帧索引从0开始
