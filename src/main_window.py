@@ -205,13 +205,19 @@ class MainWindow(QMainWindow):
 
         self.root = root
         self.settings_path = root / "jh4player_settings.json"
-        self.annotations = AnnotationStore(root / "annotations.json")
+        
+        # 先加载配置（后续初始化需要使用配置值）
+        self._config = self._load_settings()
+        
+        # 从配置获取 annotations 文件路径
+        annotations_file = self._config.get("annotations_file", "annotations.json")
+        self.annotations = AnnotationStore(root / annotations_file)
         
         # 程序启动时备份 annotation（两级防护）
         self._backup_annotations_on_startup()
 
-        # Split settings (30fps video: half-minute = 900 frames)
-        self.segment_size: int = 900
+        # Split settings - 从配置读取，默认 900 帧
+        self.segment_size: int = int(self._config.get("segment_size", 900))
         self._split_ready: bool = False
         self._split_manifest_path: Path | None = None
         self._segment_paths_by_idx: dict[int, Path] = {}
@@ -238,7 +244,8 @@ class MainWindow(QMainWindow):
         self.target_id: int | None = self.annotations.target_id
         self.current_frame_idx: int = 0
         self.playing: bool = False
-        self.base_fps: float = 30
+        # 从配置读取 base_fps，默认 30
+        self.base_fps: float = float(self._config.get("base_fps", 30))
         self.speed: float = 1.0
         self.fps: float = self.base_fps * self.speed
 
@@ -249,8 +256,8 @@ class MainWindow(QMainWindow):
         self._manual_bbox_track_id: float | None = None
         self._manual_bbox_prompt_track_id_on_confirm: bool = False
 
-        # SAM2 integration state
-        self._sam_base_url: str = "http://127.0.0.1:8848"
+        # SAM2 integration state - 从配置读取
+        self._sam_base_url: str = self._config.get("sam_base_url", "http://127.0.0.1:8848")
         self._sam_proc: QProcess | None = None
         self._sam_track_thread: QThread | None = None
         self._sam_track_worker: _SamTrackWorker | None = None
@@ -410,8 +417,24 @@ class MainWindow(QMainWindow):
 
     # --- data sources ---
     def _resolve_default_tracking_json(self) -> Path:
-        candidates = sorted(self.root.glob("*_21128000001_21128000010.json"))
-        tracking_candidates = [p for p in candidates if "_image_" not in p.name]
+        # 从配置获取 tracking_json 路径和搜索 pattern
+        config_tracking_json = self._config.get("tracking_json")
+        if config_tracking_json:
+            p = Path(config_tracking_json)
+            if p.exists():
+                return p
+        
+        # 使用配置中的 pattern 搜索，默认 *.json
+        pattern = self._config.get("tracking_json_pattern", "*.json")
+        candidates = sorted(self.root.glob(pattern))
+        # 过滤掉配置文件和缓存文件
+        tracking_candidates = [
+            p for p in candidates 
+            if "_image_" not in p.name 
+            and p.name != "jh4player_settings.json"
+            and not p.name.startswith("tracks_cache_")
+            and p.name != "annotations.json"
+        ]
         if len(tracking_candidates) == 1:
             return tracking_candidates[0]
         if len(tracking_candidates) > 1:
@@ -422,7 +445,7 @@ class MainWindow(QMainWindow):
             return self.root / str(choice)
         if len(candidates) == 1:
             return candidates[0]
-        raise FileNotFoundError("tracking json not found in workspace root")
+        raise FileNotFoundError(f"tracking json not found in workspace root (pattern: {pattern})")
 
     def _load_settings(self) -> dict:
         if not self.settings_path.exists():
@@ -433,31 +456,37 @@ class MainWindow(QMainWindow):
             return {}
 
     def _save_settings(self, tracking_json: Path, frame_dir: Path) -> None:
-        payload = {
+        # 保留现有配置，只更新路径相关的配置
+        payload = dict(self._config)
+        payload.update({
             "tracking_json": str(tracking_json),
             "frame_dir": str(frame_dir),
             "segment_size": int(self.segment_size),
-        }
+        })
+        self._config = payload
         self.settings_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _resolve_initial_sources(self) -> tuple[Path, Path]:
         # Defaults: relative to code workspace
-        default_frame_dir = self.root / "frame"
-        default_tracking_json = self._resolve_default_tracking_json()
-
-        # Optional persisted override
-        s = self._load_settings()
-        tj = Path(s.get("tracking_json")) if s.get("tracking_json") else default_tracking_json
+        default_frame_dir = self.root / "frames"
+        
+        # 使用已加载的配置 self._config
+        s = self._config
+        
+        # 先尝试从配置读取 frame_dir
         fd = Path(s.get("frame_dir")) if s.get("frame_dir") else default_frame_dir
-        try:
-            if s.get("segment_size") is not None:
-                self.segment_size = int(s.get("segment_size"))
-        except Exception:
-            self.segment_size = 900
+        
+        # 尝试从配置读取 tracking_json，否则使用默认查找逻辑
+        if s.get("tracking_json"):
+            tj = Path(s.get("tracking_json"))
+        else:
+            tj = self._resolve_default_tracking_json()
+        
+        # segment_size 已在 __init__ 中从配置加载
 
         # Validate; fallback to defaults if invalid
         if not tj.exists():
-            tj = default_tracking_json
+            tj = self._resolve_default_tracking_json()
         if not fd.exists():
             fd = default_frame_dir
         return tj, fd
