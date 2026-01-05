@@ -215,6 +215,9 @@ class MainWindow(QMainWindow):
         
         # 程序启动时备份 annotation（两级防护）
         self._backup_annotations_on_startup()
+        
+        # 程序启动时清理过期的缓存文件
+        self._cleanup_stale_caches()
 
         # Split settings - 从配置读取，默认 900 帧
         self.segment_size: int = int(self._config.get("segment_size", 900))
@@ -752,6 +755,54 @@ class MainWindow(QMainWindow):
             self._cleanup_old_backups(backup_dir, prefix="annotations_startup_", keep=20)
         except Exception as e:
             print(f"[WARN] 启动时备份 annotation 失败: {e}")
+
+    def _cleanup_stale_caches(self) -> None:
+        """程序启动时清理过期的缓存文件，确保使用最新的分片数据"""
+        try:
+            # 查找所有缓存文件
+            cache_files = list(self.root.glob("tracks_cache_*.pkl.gz"))
+            cleaned = 0
+            for cache_path in cache_files:
+                # 根据缓存文件名推断对应的 JSON 文件
+                # 格式: tracks_cache_<json_stem>.pkl.gz
+                stem = cache_path.stem  # tracks_cache_seg_00000.pkl
+                stem = stem.replace(".pkl", "")  # tracks_cache_seg_00000
+                json_stem = stem.replace("tracks_cache_", "")  # seg_00000
+                
+                # 尝试查找对应的 JSON 文件
+                possible_json_paths = [
+                    self.root / f"{json_stem}.json",  # 根目录
+                ]
+                # 检查分片目录
+                for split_dir in self.root.glob("*_split"):
+                    possible_json_paths.append(split_dir / f"{json_stem}.json")
+                
+                json_path = None
+                for p in possible_json_paths:
+                    if p.exists():
+                        json_path = p
+                        break
+                
+                if json_path is None:
+                    # 找不到对应 JSON，删除孤立缓存
+                    cache_path.unlink()
+                    print(f"[CACHE] 删除孤立缓存: {cache_path.name}")
+                    cleaned += 1
+                    continue
+                
+                # 检查缓存是否过期（JSON 修改时间 >= 缓存修改时间 表示缓存过期）
+                cache_mtime = cache_path.stat().st_mtime
+                json_mtime = json_path.stat().st_mtime
+                # 如果 JSON 修改时间 + 0.1秒 >= 缓存时间，说明缓存可能过期
+                if json_mtime + 0.1 >= cache_mtime:
+                    cache_path.unlink()
+                    print(f"[CACHE] 删除过期缓存: {cache_path.name} (JSON 更新于 {json_path.name})")
+                    cleaned += 1
+            
+            if cleaned > 0:
+                print(f"[CACHE] 启动时清理了 {cleaned} 个过期/孤立缓存文件")
+        except Exception as e:
+            print(f"[WARN] 清理缓存失败: {e}")
 
     def _backup_annotations_on_exit(self) -> None:
         """程序退出时备份 annotation.json（两级防护：startup + exit）"""
@@ -1464,15 +1515,17 @@ class MainWindow(QMainWindow):
         if segment_json is not None:
             try:
                 cache_path = self._cache_path_for(Path(segment_json))
-                if cache_path.exists():
+                # 如果当前正在查看这个 segment，刷新 track_store（强制重建缓存）
+                if self.track_store.tracking_json == Path(segment_json):
+                    self.track_store.invalidate_cache()
+                    self.track_store = TrackStore(Path(segment_json), cache_path, force_rebuild=True)
+                    self.render_frame(self.current_frame_idx)
+                elif cache_path.exists():
+                    # 不是当前 segment，直接删除缓存文件
                     cache_path.unlink()
                     print(f"[DEBUG] 已删除缓存文件: {cache_path}")
-                # 如果当前正在查看这个 segment，刷新 track_store
-                if self.track_store.tracking_json == Path(segment_json):
-                    self.track_store = TrackStore(Path(segment_json), cache_path)
-                    self.render_frame(self.current_frame_idx)
             except Exception as e:
-                print(f"[DEBUG] 删除缓存文件失败: {e}")
+                print(f"[DEBUG] 删除/刷新缓存失败: {e}")
 
         # 重建删除索引（因为 delete_rules 已被清空）
         self._rebuild_delete_index()
