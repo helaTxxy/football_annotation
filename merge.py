@@ -73,7 +73,7 @@ def main() -> int:
 	parser.add_argument(
 		"--output",
 		type=Path,
-		default=Path("1128_man.json"),
+		default=Path("1128_man_1.json"),
 		help="Output merged json path",
 	)
 	parser.add_argument(

@@ -23,6 +23,7 @@ class VideoCanvas(QWidget):
         self._pixmap: Optional[QPixmap] = None
         self._detections: list[Detection] = []
         self._selected_track_id: Optional[int] = None
+        self._target_id: Optional[int] = None  # 锁定的目标ID
 
         self._drawing_bbox: bool = False
         self._bbox_start: Optional[QPoint] = None
@@ -38,6 +39,10 @@ class VideoCanvas(QWidget):
 
     def set_selected_track(self, track_id: Optional[int]) -> None:
         self._selected_track_id = track_id
+        self.update()
+
+    def set_target_id(self, target_id: Optional[int]) -> None:
+        self._target_id = target_id
         self.update()
 
     def enable_bbox_mode(self, enabled: bool) -> None:
@@ -123,7 +128,17 @@ class VideoCanvas(QWidget):
 
         painter.setFont(QFont("Segoe UI", 10))
 
+        # 分离目标ID的检测框，确保最后绘制（在顶层）
+        target_dets = []
+        other_dets = []
         for det in self._detections:
+            if self._target_id is not None and det.track_id == self._target_id:
+                target_dets.append(det)
+            else:
+                other_dets.append(det)
+
+        # 先绘制非目标ID的检测框
+        for det in other_dets:
             x, y, w, h = det.bbox_ltwh
             p1 = self._img_to_widget(x, y, scale, xoff, yoff)
             p2 = self._img_to_widget(x + w, y + h, scale, xoff, yoff)
@@ -132,6 +147,21 @@ class VideoCanvas(QWidget):
             is_sel = (self._selected_track_id is not None and det.track_id == self._selected_track_id)
             pen = QPen(Qt.GlobalColor.yellow if is_sel else Qt.GlobalColor.green)
             pen.setWidth(3 if is_sel else 2)
+            painter.setPen(pen)
+            painter.drawRect(rect)
+
+            painter.setPen(QPen(Qt.GlobalColor.white))
+            painter.drawText(rect.topLeft() + QPoint(2, 12), f"{det.track_id} {det.role}")
+
+        # 最后绘制目标ID的检测框（红色、加粗、顶层）
+        for det in target_dets:
+            x, y, w, h = det.bbox_ltwh
+            p1 = self._img_to_widget(x, y, scale, xoff, yoff)
+            p2 = self._img_to_widget(x + w, y + h, scale, xoff, yoff)
+            rect = QRect(p1, p2)
+
+            pen = QPen(Qt.GlobalColor.red)
+            pen.setWidth(6)  # 加粗一倍（原来是3，现在是6）
             painter.setPen(pen)
             painter.drawRect(rect)
 

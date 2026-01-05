@@ -273,6 +273,10 @@ class MainWindow(QMainWindow):
 
         self._selected_det: Detection | None = None
         self._awaiting_remap_click: bool = False
+        self._awaiting_duplicate_selection: bool = False  # 等待用户选择正确的重复目标
+        self._duplicate_target_dets: list[Detection] = []  # 重复的目标检测列表
+        self._duplicate_batch_mode: bool = False  # 是否批量处理后续帧的重复
+        self._duplicate_batch_end_frame: int | None = None  # 批量处理的结束帧
 
         self._deleted_track_ids: set[int] = set()
         self._deleted_single: dict[tuple[str, int], list[tuple[float, float, float, float]]] = {}
@@ -893,10 +897,11 @@ class MainWindow(QMainWindow):
         dets = self.track_store.detections_for(image_id)
         
         # 收集手动/SAM标注的 (image_id, track_id) 集合，用于覆盖原有检测
-        manual_keys: set[tuple[str, int]] = set()
+        # 注意：这里收集的是 manual bbox 的原始 track_id
+        manual_track_ids: set[int] = set()
         for ann in self.annotations.manual_bboxes:
             if ann.frame_idx == frame_idx and ann.image_id == image_id:
-                manual_keys.add((ann.image_id, int(float(ann.track_id))))
+                manual_track_ids.add(int(float(ann.track_id)))
         
         mapped: list[Detection] = []
         for d in dets:
@@ -910,8 +915,9 @@ class MainWindow(QMainWindow):
             if self._is_deleted(image_id, display_det.track_id, display_det.bbox_ltwh, frame_idx):
                 continue
             
-            # 如果该 (image_id, track_id) 已有手动/SAM标注，跳过原有检测，只显示手动的
-            if (image_id, display_det.track_id) in manual_keys:
+            # 如果该 track_id 已有手动/SAM标注，跳过原有检测，只显示手动的
+            # 检查原始 track_id 和 remap 后的 track_id
+            if d.track_id in manual_track_ids or display_det.track_id in manual_track_ids:
                 continue
 
             mapped.append(display_det)
@@ -1119,10 +1125,20 @@ class MainWindow(QMainWindow):
         else:
             self.render_frame(frame_idx)
 
+        # 如果正在等待用户选择重复的目标，跳过后续检测
+        if self._awaiting_duplicate_selection:
+            return
+
         # auto-stop if target missing or tracking jump detected
         if self.target_id is not None:
             dets = self.detections_for_frame(frame_idx)
-            target_det = next((d for d in dets if d.track_id == self.target_id), None)
+            target_dets = [d for d in dets if d.track_id == self.target_id]
+            
+            # 如果有多个目标ID，不进行IOU检测（已经在render_frame中处理了）
+            if len(target_dets) > 1:
+                return
+            
+            target_det = target_dets[0] if target_dets else None
             
             # 如果处于"不在画面内"模式
             if self._target_out_of_view:
@@ -1163,9 +1179,155 @@ class MainWindow(QMainWindow):
         pm = QPixmap(str(fi.path))
         dets = self.detections_for_frame(frame_idx)
         self.canvas.set_frame(pm, dets)
+        self.canvas.set_target_id(self.target_id)  # 传递锁定的目标ID给canvas
         track_ids = sorted(set(d.track_id for d in dets))
         has_target = self.target_id in track_ids if self.target_id is not None else None
         self.set_status(f"frame={frame_idx} image_id={fi.image_id}  dets={len(dets)}  target={self.target_id}  has_target={has_target}")
+        
+        # 检查是否有重复的目标ID（同一帧出现两个相同track_id的bbox）
+        if self.target_id is not None:
+            target_dets = [d for d in dets if d.track_id == self.target_id]
+            if len(target_dets) > 1:
+                self.action_pause()
+                self._handle_duplicate_target_id(target_dets)
+
+    def _handle_duplicate_target_id(self, target_dets: list[Detection]) -> None:
+        """处理同一帧出现多个目标ID的情况，让用户选择正确的一个"""
+        # 先检测后续有多少帧也存在重复情况
+        duplicate_frame_count = self._count_duplicate_frames_ahead()
+        
+        msg = QMessageBox(self)
+        msg.setWindowTitle("检测到重复目标ID")
+        
+        if duplicate_frame_count > 0:
+            msg.setText(
+                f"当前帧存在 {len(target_dets)} 个 track_id={self.target_id} 的bbox。\n"
+                f"检测到后续 {duplicate_frame_count} 帧也存在重复情况。\n\n"
+                f"请选择处理方式："
+            )
+            msg.setIcon(QMessageBox.Icon.Warning)
+            btn_single = msg.addButton("仅处理当前帧", QMessageBox.ButtonRole.ActionRole)
+            btn_batch = msg.addButton(f"批量处理到重复结束（{duplicate_frame_count}帧）", QMessageBox.ButtonRole.ActionRole)
+            msg.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+            msg.exec()
+            
+            clicked = msg.clickedButton()
+            if clicked == btn_single:
+                self._duplicate_batch_mode = False
+                self._duplicate_batch_end_frame = None
+            elif clicked == btn_batch:
+                self._duplicate_batch_mode = True
+                self._duplicate_batch_end_frame = self.current_frame_idx + duplicate_frame_count
+            else:
+                # 取消
+                return
+        else:
+            msg.setText(f"当前帧存在 {len(target_dets)} 个 track_id={self.target_id} 的bbox，请点击正确的那个，其他的将被标记为 -1")
+            msg.setIcon(QMessageBox.Icon.Warning)
+            msg.addButton("确定", QMessageBox.ButtonRole.AcceptRole)
+            msg.exec()
+            self._duplicate_batch_mode = False
+            self._duplicate_batch_end_frame = None
+        
+        # 设置状态，等待用户点击选择正确的bbox
+        self._awaiting_duplicate_selection = True
+        self._duplicate_target_dets = target_dets
+        if self._duplicate_batch_mode:
+            self.set_status(f"请点击正确的目标bbox，将自动处理到第 {self._duplicate_batch_end_frame} 帧")
+        else:
+            self.set_status(f"请点击正确的目标bbox（共{len(target_dets)}个），其他将被标记为 -1")
+
+    def _count_duplicate_frames_ahead(self) -> int:
+        """检测从当前帧开始，后续连续有多少帧存在重复的target_id"""
+        if self.target_id is None:
+            return 0
+        
+        count = 0
+        for frame_idx in range(self.current_frame_idx + 1, len(self.frames)):
+            dets = self.detections_for_frame(frame_idx)
+            target_dets = [d for d in dets if d.track_id == self.target_id]
+            if len(target_dets) > 1:
+                count += 1
+            else:
+                # 一旦不再重复就停止计数
+                break
+        return count
+
+    def _process_duplicate_frames_batch(
+        self, 
+        start_frame: int, 
+        end_frame: int, 
+        correct_bbox: tuple[float, float, float, float]
+    ) -> int:
+        """
+        批量处理后续帧中的重复目标ID情况。
+        使用IoU匹配找出与用户选择的正确bbox最接近的那个，删除其他重复的。
+        返回成功处理的帧数。
+        """
+        if self.target_id is None:
+            return 0
+        
+        processed_count = 0
+        last_correct_bbox = correct_bbox
+        
+        for frame_idx in range(start_frame, min(end_frame + 1, len(self.frames))):
+            dets = self.detections_for_frame(frame_idx)
+            target_dets = [d for d in dets if d.track_id == self.target_id]
+            
+            if len(target_dets) <= 1:
+                # 不再重复，跳过
+                if len(target_dets) == 1:
+                    # 更新 last_correct_bbox 用于后续帧的匹配
+                    last_correct_bbox = target_dets[0].bbox_ltwh
+                continue
+            
+            # 找出与上一帧正确bbox IoU最高的那个
+            best_det = None
+            best_iou = -1.0
+            for d in target_dets:
+                iou = self._bbox_iou(last_correct_bbox, d.bbox_ltwh)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_det = d
+            
+            if best_det is None:
+                continue
+            
+            # 更新 last_correct_bbox
+            last_correct_bbox = best_det.bbox_ltwh
+            fi = self.frames[frame_idx]
+            
+            # 删除其他重复的bbox
+            def _bbox_match(a: tuple, b: tuple) -> bool:
+                return all(abs(a[i] - b[i]) <= 1e-3 for i in range(4))
+            
+            for other_det in target_dets:
+                if _bbox_match(other_det.bbox_ltwh, best_det.bbox_ltwh):
+                    continue
+                # 删除这个错误的bbox
+                if other_det.role == "manual":
+                    self.annotations.remap_manual_bbox_single(
+                        frame_idx=frame_idx,
+                        image_id=other_det.image_id,
+                        old_track_id=float(other_det.track_id),
+                        bbox_ltwh=other_det.bbox_ltwh,
+                        new_track_id=-1.0,
+                    )
+                else:
+                    self.annotations.add_delete_rule(
+                        BboxDeleteRule(
+                            kind="single", 
+                            track_id=float(other_det.track_id), 
+                            image_id=other_det.image_id, 
+                            bbox_ltwh=other_det.bbox_ltwh
+                        )
+                    )
+            
+            processed_count += 1
+        
+        # 保存更改
+        self.annotations.save()
+        return processed_count
 
     # --- background auto commit ---
     def _autocommit_segment_async(self, segment_json: Path, target_seg_idx: int | None = None) -> None:
@@ -1191,8 +1353,9 @@ class MainWindow(QMainWindow):
         delete_rules_remaining = []
         for r in all_delete_rules:
             if r.kind == "track_id":
-                # track_id 删除规则应用于所有分片，但只在当前分片执行一次
+                # track_id 删除规则应用于所有分片，需要保留在内存中以便其他分片也能使用
                 delete_rules.append(r)
+                delete_rules_remaining.append(r)  # 同时保留，因为需要全局生效
             elif r.kind == "single" and r.image_id is not None:
                 fidx = self.frame_idx_by_image_id.get(str(r.image_id))
                 if fidx is not None and seg_start <= fidx <= seg_end:
@@ -1204,6 +1367,9 @@ class MainWindow(QMainWindow):
                 r_to = r.to_frame_idx if r.to_frame_idx is not None else seg_end
                 if r_from <= seg_end and r_to >= seg_start:
                     delete_rules.append(r)
+                    # frame_range 可能跨多个分片，需要保留
+                    if r_to is None or r_to > seg_end:
+                        delete_rules_remaining.append(r)
                 else:
                     delete_rules_remaining.append(r)
             else:
@@ -1213,12 +1379,33 @@ class MainWindow(QMainWindow):
         sam_requests = [s for s in all_sam_requests if seg_start <= int(s.frame_idx) <= seg_end]
         missing_events = [e for e in all_missing_events if seg_start <= int(e.frame_idx) <= seg_end]
 
+        # 筛选属于当前分片的 id_remap_rules
+        # 重要：remap 规则在写回后需要更新 from_frame_idx，使其不再影响已写回的分片
+        # 否则，已写入的手动标注重新加载后会被 remap 规则错误地映射
+        all_remap_rules = list(self.annotations.id_remap_rules)
+        remap_rules = []
+        remap_rules_remaining = []
+        for r in all_remap_rules:
+            # 规则影响当前分片的条件：from_frame_idx <= seg_end
+            if r.from_frame_idx <= seg_end:
+                remap_rules.append(r)
+                # 写回后，规则的 from_frame_idx 应该更新为下一个分片的开始
+                # 这样规则不会再影响已写回的分片
+                updated_rule = IdRemapRule(
+                    from_frame_idx=seg_end + 1,
+                    old_id=r.old_id,
+                    new_id=r.new_id,
+                )
+                remap_rules_remaining.append(updated_rule)
+            else:
+                remap_rules_remaining.append(r)
+
         # 保留不属于当前分片的数据（稍后写回 annotation）
         remaining_bboxes = [b for b in all_manual_bboxes if not (seg_start <= int(b.frame_idx) <= seg_end)]
         remaining_sam_requests = [s for s in all_sam_requests if not (seg_start <= int(s.frame_idx) <= seg_end)]
         remaining_missing_events = [e for e in all_missing_events if not (seg_start <= int(e.frame_idx) <= seg_end)]
 
-        if not manual_bboxes and not delete_rules and not sam_requests and not missing_events:
+        if not manual_bboxes and not delete_rules and not sam_requests and not missing_events and not remap_rules:
             return
 
         # Archive snapshot for safety
@@ -1239,10 +1426,14 @@ class MainWindow(QMainWindow):
             pass
 
         # 只清除已写回的数据，保留未写回的数据
+        # 重要：id_remap_rules 也需要更新！
         self.annotations.manual_bboxes = remaining_bboxes
         self.annotations.delete_rules = delete_rules_remaining
         self.annotations.sam_requests = remaining_sam_requests
         self.annotations.missing_events = remaining_missing_events
+        self.annotations.id_remap_rules = remap_rules_remaining  # 更新 remap 规则
+        # 同步更新内存中的 id_remap_rules（用于 apply_id_remap）
+        self.id_remap_rules = list(remap_rules_remaining)
         self.annotations.save()
 
         self._autocommit_inflight = True
@@ -1253,7 +1444,7 @@ class MainWindow(QMainWindow):
             segment_json=segment_json,
             manual_bboxes=manual_bboxes,
             delete_rules=delete_rules,
-            id_remap_rules=list(self.annotations.id_remap_rules),
+            id_remap_rules=remap_rules,  # 只传递属于当前分片的 remap 规则
             frame_idx_by_image_id=self.frame_idx_by_image_id,
         )
         self._autocommit_worker.moveToThread(self._autocommit_thread)
@@ -1347,7 +1538,7 @@ class MainWindow(QMainWindow):
         )
 
         btn_correct = msg.addButton("正确（继续跟踪）", QMessageBox.ButtonRole.AcceptRole)
-        btn_wrong = msg.addButton("错误（映射为404 + 手动标注）", QMessageBox.ButtonRole.DestructiveRole)
+        btn_wrong = msg.addButton("错误（映射为-1 + 手动标注）", QMessageBox.ButtonRole.DestructiveRole)
         btn_cancel = msg.addButton("取消（保持不在画面内状态）", QMessageBox.ButtonRole.RejectRole)
 
         msg.exec()
@@ -1364,24 +1555,24 @@ class MainWindow(QMainWindow):
             return
 
         if clicked == btn_wrong:
-            # 错误：将当前帧起的 target_id 映射为 404（这样之后的都会被视为 404）
+            # 错误：将当前帧起的 target_id 映射为 -1（这样之后的都会被视为 -1）
             if self.target_id is None:
                 self.set_status("错误：target_id 未设置")
                 return
             
             target_id_int = int(self.target_id)
             
-            # 1. 添加 ID 映射规则：将当前帧起的 target_id 映射为 404
-            # 这会让原始跟踪数据中的错误ID显示为404
-            rule = IdRemapRule(from_frame_idx=frame_idx, old_id=target_id_int, new_id=404)
+            # 1. 添加 ID 映射规则：将当前帧起的 target_id 映射为 -1
+            # 这会让原始跟踪数据中的错误ID显示为-1
+            rule = IdRemapRule(from_frame_idx=frame_idx, old_id=target_id_int, new_id=-1)
             self.id_remap_rules.append(rule)
             self.annotations.add_remap_rule(rule)
             
             # 2. 删除当前帧中这个错误的 bbox（使用 single 删除规则）
-            # 这样当前帧的错误bbox会被彻底删除，不会显示为404
+            # 这样当前帧的错误bbox会被彻底删除，不会显示为-1
             delete_rule = BboxDeleteRule(
                 kind="single",
-                track_id=float(404),  # 映射后的ID是404
+                track_id=float(-1),  # 映射后的ID是-1
                 image_id=fi.image_id,
                 bbox_ltwh=target_det.bbox_ltwh,
             )
@@ -1402,11 +1593,11 @@ class MainWindow(QMainWindow):
             # 保存到 annotations.json
             self.annotations.save()
             
-            # 重新渲染（应用 ID 映射后 target 会变成 404）
+            # 重新渲染（应用 ID 映射后 target 会变成 -1）
             self.render_frame(frame_idx)
             
             # 不弹出手动标注弹窗，让用户继续跳帧查找
-            self.set_status(f"已删除帧 {frame_idx} 的错误bbox，并将之后的 ID {target_id_int} 映射为 404。请继续跳帧查找目标真正重新出现的位置。")
+            self.set_status(f"已删除帧 {frame_idx} 的错误bbox，并将之后的 ID {target_id_int} 映射为 -1。请继续跳帧查找目标真正重新出现的位置。")
             return
 
         # 取消或关闭对话框：保持 out_of_view 状态，用户可以继续跳帧查找
@@ -1421,10 +1612,10 @@ class MainWindow(QMainWindow):
             f"检测到可能的跟踪错误！\n"
             f"target_id={self.target_id} 在帧 {frame_idx} 的位置与上一帧没有交集。\n"
             f"这通常意味着 ID 跳到了另一个球员身上。\n\n"
-            f"是否将当前帧起的错误 ID 映射为 404，并手动添加正确的标注？"
+            f"是否将当前帧起的错误 ID 映射为 -1，并手动添加正确的标注？"
         )
 
-        btn_fix = msg.addButton("修正（映射为404 + 手动标注）", QMessageBox.ButtonRole.ActionRole)
+        btn_fix = msg.addButton("修正（映射为-1 + 手动标注）", QMessageBox.ButtonRole.ActionRole)
         btn_ignore = msg.addButton("忽略（继续跟踪）", QMessageBox.ButtonRole.RejectRole)
         btn_cancel = msg.addButton("取消", QMessageBox.ButtonRole.RejectRole)
 
@@ -1438,8 +1629,8 @@ class MainWindow(QMainWindow):
             
             target_id_int = int(self.target_id)
             
-            # 1. 将当前帧起的 target_id 映射为 404
-            rule = IdRemapRule(from_frame_idx=frame_idx, old_id=target_id_int, new_id=404)
+            # 1. 将当前帧起的 target_id 映射为 -1
+            rule = IdRemapRule(from_frame_idx=frame_idx, old_id=target_id_int, new_id=-1)
             self.id_remap_rules.append(rule)
             self.annotations.add_remap_rule(rule)
             
@@ -1459,7 +1650,7 @@ class MainWindow(QMainWindow):
             self.render_frame(frame_idx)
             
             # 6. 进入手动标注流程
-            self.set_status(f"已将帧 {frame_idx} 起的 ID {target_id_int} 映射为 404，请手动标注正确的目标")
+            self.set_status(f"已将帧 {frame_idx} 起的 ID {target_id_int} 映射为 -1，请手动标注正确的目标")
             self.start_not_detected_flow(frame_idx)
             return
 
@@ -1862,6 +2053,60 @@ class MainWindow(QMainWindow):
         self._set_selected_det(det)
         self.set_status(f"已选中：image_id={det.image_id} track_id={det.track_id} role={det.role}")
 
+        # 处理重复目标ID选择
+        if self._awaiting_duplicate_selection:
+            self._awaiting_duplicate_selection = False
+            # 用户选择了正确的目标，将其他重复的标记为 -1
+            # 使用 image_id 和 bbox 坐标精确匹配
+            def _bbox_match(a: tuple, b: tuple) -> bool:
+                return all(abs(a[i] - b[i]) <= 1e-3 for i in range(4))
+            
+            # 记录用户选择的正确bbox，用于后续帧的IoU匹配
+            correct_bbox = det.bbox_ltwh
+            
+            # 处理当前帧
+            for other_det in self._duplicate_target_dets:
+                # 跳过用户选中的那个（通过 image_id 和 bbox 坐标精确匹配）
+                if other_det.image_id == det.image_id and _bbox_match(other_det.bbox_ltwh, det.bbox_ltwh):
+                    continue
+                # 将其他的当前帧的这个特定bbox标记为 -1
+                if other_det.role == "manual":
+                    # 对于 manual bbox，只修改这个特定的bbox
+                    self.annotations.remap_manual_bbox_single(
+                        frame_idx=self.current_frame_idx,
+                        image_id=other_det.image_id,
+                        old_track_id=float(other_det.track_id),
+                        bbox_ltwh=other_det.bbox_ltwh,
+                        new_track_id=-1.0,
+                    )
+                else:
+                    # 对于原始检测，添加 single 删除规则来删除这个特定bbox
+                    self.annotations.add_delete_rule(
+                        BboxDeleteRule(kind="single", track_id=float(other_det.track_id), 
+                                       image_id=other_det.image_id, bbox_ltwh=other_det.bbox_ltwh)
+                    )
+            
+            # 如果是批量模式，处理后续帧
+            batch_processed = 0
+            if self._duplicate_batch_mode and self._duplicate_batch_end_frame is not None:
+                batch_processed = self._process_duplicate_frames_batch(
+                    start_frame=self.current_frame_idx + 1,
+                    end_frame=self._duplicate_batch_end_frame,
+                    correct_bbox=correct_bbox,
+                )
+            
+            self._duplicate_target_dets = []
+            self._duplicate_batch_mode = False
+            self._duplicate_batch_end_frame = None
+            self._rebuild_delete_index()
+            self.render_frame(self.current_frame_idx)
+            
+            if batch_processed > 0:
+                self.set_status(f"已保留选中的bbox，批量处理了 {batch_processed} 帧的重复情况")
+            else:
+                self.set_status(f"已保留选中的bbox，其他重复的已删除")
+            return
+
         if not self._awaiting_remap_click:
             return
         self._awaiting_remap_click = False
@@ -1934,14 +2179,26 @@ class MainWindow(QMainWindow):
             return
         
         if clicked == btn_from_current:
-            # 只删除当前帧及之后：使用 ID remap 机制（映射为 404）
-            rule = IdRemapRule(from_frame_idx=self.current_frame_idx, old_id=det.track_id, new_id=404)
-            self.id_remap_rules.append(rule)
-            self.annotations.add_remap_rule(rule)
-            self.annotations.save()
+            # 只删除当前帧及之后
+            # 对于 manual bbox，直接从 annotations 中删除
+            removed_manual = self.annotations.delete_manual_bboxes_from_frame(
+                track_id=float(det.track_id),
+                from_frame_idx=self.current_frame_idx
+            )
+            # 对于原始检测数据，使用 frame_range 删除规则
+            self.annotations.add_delete_rule(
+                BboxDeleteRule(
+                    kind="frame_range",
+                    track_id=float(det.track_id),
+                    from_frame_idx=self.current_frame_idx,
+                    to_frame_idx=None  # None 表示到结尾
+                )
+            )
+            self._rebuild_delete_index()
             self.render_frame(self.current_frame_idx)
-            self.set_status(f"已将 track_id={det.track_id} 从帧 {self.current_frame_idx} 起映射为 404（之前的帧不受影响）")
+            self.set_status(f"已删除 track_id={det.track_id} 从帧 {self.current_frame_idx} 起的所有框（手动标注删除 {removed_manual} 条）")
             return
+
 
     def action_remap_selected_to_target(self) -> None:
         """将选中的 bbox 从当前帧起映射为用户输入的 ID"""
@@ -1950,15 +2207,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先选择一个bbox")
             return
 
-        # 默认目标ID为 target_id（如果已设置），否则为 404
-        default_id = self.target_id if self.target_id is not None else 404
+        # 默认目标ID为 target_id（如果已设置），否则为 -1
+        default_id = self.target_id if self.target_id is not None else -1
         
         new_id, ok = QInputDialog.getInt(
             self,
             "映射ID",
             f"将 track_id={det.track_id} 从当前帧（帧 {self.current_frame_idx}）起映射为：",
             value=int(default_id),
-            min=1,
+            min=-1,
             max=10**9
         )
         if not ok:
@@ -1968,8 +2225,16 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "目标ID与当前ID相同，无需映射")
             return
 
+        # 对于 manual bbox，直接修改 annotations 中的 track_id
+        remapped_manual = self.annotations.remap_manual_bboxes_from_frame(
+            old_track_id=float(det.track_id),
+            new_track_id=float(new_id),
+            from_frame_idx=self.current_frame_idx
+        )
+        # 对于原始检测数据，使用 ID remap 规则
         rule = IdRemapRule(from_frame_idx=self.current_frame_idx, old_id=det.track_id, new_id=int(new_id))
         self.id_remap_rules.append(rule)
         self.annotations.add_remap_rule(rule)
         self.render_frame(self.current_frame_idx)
-        self.set_status(f"已将 track_id={det.track_id} 从帧 {self.current_frame_idx} 起映射为 {new_id}")
+        self.set_status(f"已将 track_id={det.track_id} 从帧 {self.current_frame_idx} 起映射为 {new_id}（手动标注修改 {remapped_manual} 条）")
+

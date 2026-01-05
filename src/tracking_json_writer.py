@@ -114,6 +114,15 @@ def commit_manual_bboxes_to_tracking_json(
     id_remap_rules: Iterable[IdRemapRule] | None = None,
     frame_idx_by_image_id: Mapping[str, int] | None = None,
 ) -> CommitSummary:
+    """
+    将指定 track_id 的手动标注写回到 tracking JSON。
+    
+    重要说明：
+    - manual_bbox 的 track_id 是用户指定的最终 ID，不受 remap 规则影响
+    - remap 规则用于处理错误的检测数据
+    - 如果原始记录的 track_id 与目标 track_id 相同，会被手动标注替换
+    - 如果原始记录被 remap 后的 ID 与目标 track_id 相同，该记录会被删除（避免冲突）
+    """
     target_bboxes = [b for b in manual_bboxes if float(b.track_id) == float(track_id)]
     delete_rules_list = list(delete_rules or [])
     remap_rules_list = list(id_remap_rules or [])
@@ -143,6 +152,9 @@ def commit_manual_bboxes_to_tracking_json(
     for b in target_bboxes:
         key = (str(b.image_id), float(track_id))
         manual_bbox_map[key] = b.bbox_ltwh  # 后面的会覆盖前面的
+    
+    # 记录有手动标注的 image_id 集合
+    manual_image_ids = {str(b.image_id) for b in target_bboxes}
 
     with tracking_json.open("rb") as fin, tmp_path.open("w", encoding="utf-8", newline="\n") as out:
         out.write("{\n  \"columns\": ")
@@ -158,28 +170,33 @@ def commit_manual_bboxes_to_tracking_json(
             image_id = str(item.get("image_id"))
             track_id_raw = item.get("track_id")
             try:
-                track_id_val = float(track_id_raw)
+                original_track_id = float(track_id_raw)
             except Exception:
-                track_id_val = None
+                original_track_id = None
 
-            # Apply id-remap rules before any checks so write-back matches UI view.
-            if remap_rules_list and track_id_val is not None:
+            # 检查原始记录是否与目标 track_id 相同
+            # 如果相同且有手动标注，则跳过（稍后写入手动标注）
+            if original_track_id == float(track_id):
+                item_key = (image_id, float(track_id))
+                if item_key in manual_bbox_map:
+                    # 原始记录会被手动标注替换，跳过
+                    replaced += 1
+                    continue
+
+            # Apply id-remap rules
+            track_id_val = original_track_id
+            if remap_rules_list and original_track_id is not None:
                 frame_idx = _frame_idx_for_image_id(image_id, frame_idx_by_image_id)
-                mapped_tid = _apply_id_remap(frame_idx, int(track_id_val), remap_rules_list)
-                if mapped_tid != int(track_id_val):
+                mapped_tid = _apply_id_remap(frame_idx, int(original_track_id), remap_rules_list)
+                if mapped_tid != int(original_track_id):
                     item["track_id"] = int(mapped_tid)
                     track_id_val = float(mapped_tid)
-
-            # 检查是否有手动标注需要替换原有记录
-            item_key = (image_id, float(track_id)) if track_id_val == float(track_id) else None
-            if item_key and item_key in manual_bbox_map:
-                # 用手动标注的bbox替换原有的
-                new_bbox = manual_bbox_map.pop(item_key)
-                item["bbox_ltwh"] = [float(x) for x in new_bbox]
-                item["track_bbox_kf_ltwh"] = [float(x) for x in new_bbox]
-                item["bbox_conf"] = 1.0
-                existing_keys.add(item_key)
-                replaced += 1
+                    
+                    # 如果 remap 后的 ID 与目标 track_id 相同，
+                    # 且该 image_id 有手动标注，则删除这条原始记录（避免冲突）
+                    if track_id_val == float(track_id) and image_id in manual_image_ids:
+                        removed += 1
+                        continue
 
             if delete_rules_list and _should_delete_item(item, delete_rules_list, track_id=float(track_id)):
                 removed += 1
@@ -193,7 +210,7 @@ def commit_manual_bboxes_to_tracking_json(
         if video_id is None:
             raise RuntimeError("could not read video_id from tracking json")
 
-        # Append remaining manual bboxes (those not found in original JSON)
+        # Append ALL manual bboxes（手动标注直接写入）
         for key, bbox in manual_bbox_map.items():
             img_id, tid = key
 
@@ -251,6 +268,12 @@ def commit_annotations_to_tracking_json(
     """Commit ALL manual bboxes + delete rules + id-remap rules into the given tracking JSON.
 
     This rewrites the (segment) JSON once, which is much faster than rewriting per-track_id.
+    
+    重要说明：
+    - manual_bbox 的 track_id 是用户指定的最终 ID，不受 remap 规则影响
+    - remap 规则用于处理错误的检测数据（将其 ID 改为 -1 或其他）
+    - 如果原始记录被 remap 后的 ID 与某个 manual_bbox 的 ID 相同，
+      则该原始记录会被删除（因为 manual_bbox 是用户的修正，应该覆盖）
     """
     manual_list = list(manual_bboxes)
     delete_rules_list = list(delete_rules or [])
@@ -273,10 +296,14 @@ def commit_annotations_to_tracking_json(
     replaced = 0
 
     # 构建手动标注的查找表：(image_id, track_id) -> bbox_ltwh（只保留最后一个/最新的）
+    # 注意：这里的 track_id 是用户指定的最终 ID
     manual_bbox_map: dict[tuple[str, float], tuple[float, float, float, float]] = {}
     for b in manual_list:
         key = (str(b.image_id), float(b.track_id))
         manual_bbox_map[key] = b.bbox_ltwh  # 后面的会覆盖前面的
+    
+    # 记录哪些 (image_id, track_id) 有手动标注，用于判断是否删除被 remap 后的原始记录
+    manual_bbox_keys = set(manual_bbox_map.keys())
 
     with tracking_json.open("rb") as fin, tmp_path.open("w", encoding="utf-8", newline="\n") as out:
         out.write("{\n  \"columns\": ")
@@ -294,27 +321,33 @@ def commit_annotations_to_tracking_json(
             image_id = str(item.get("image_id"))
             track_id_raw = item.get("track_id")
             try:
-                track_id_val = float(track_id_raw)
+                original_track_id = float(track_id_raw)
             except Exception:
-                track_id_val = None
+                original_track_id = None
 
-            # Apply id remap
-            if remap_rules_list and track_id_val is not None:
+            # 检查是否有手动标注要覆盖这条原始记录（使用原始 track_id 匹配）
+            # 如果原始记录的 track_id 与某个 manual_bbox 相同，则跳过原始记录（稍后会写入 manual_bbox）
+            original_key = (image_id, float(original_track_id)) if original_track_id is not None else None
+            if original_key and original_key in manual_bbox_keys:
+                # 原始记录会被手动标注替换，跳过
+                replaced += 1
+                continue
+
+            # Apply id remap（只改变 track_id，用于标记错误的检测）
+            track_id_val = original_track_id
+            if remap_rules_list and original_track_id is not None:
                 frame_idx = _frame_idx_for_image_id(image_id, frame_idx_by_image_id)
-                mapped_tid = _apply_id_remap(frame_idx, int(track_id_val), remap_rules_list)
-                if mapped_tid != int(track_id_val):
+                mapped_tid = _apply_id_remap(frame_idx, int(original_track_id), remap_rules_list)
+                if mapped_tid != int(original_track_id):
                     item["track_id"] = int(mapped_tid)
                     track_id_val = float(mapped_tid)
-
-            # 检查是否有手动标注需要替换原有记录
-            item_key = (image_id, float(track_id_val)) if track_id_val is not None else None
-            if item_key and item_key in manual_bbox_map:
-                # 用手动标注的bbox替换原有的
-                new_bbox = manual_bbox_map.pop(item_key)
-                item["bbox_ltwh"] = [float(x) for x in new_bbox]
-                item["track_bbox_kf_ltwh"] = [float(x) for x in new_bbox]
-                item["bbox_conf"] = 1.0
-                replaced += 1
+                    
+                    # 如果 remap 后的 ID 与某个 manual_bbox 的 ID 冲突，
+                    # 则删除这条原始记录（因为 manual_bbox 是用户的修正）
+                    remapped_key = (image_id, float(mapped_tid))
+                    if remapped_key in manual_bbox_keys:
+                        removed += 1
+                        continue
 
             # Apply delete rules (delete rules are keyed by track_id; treat them after remap).
             if delete_rules_list:
@@ -337,7 +370,7 @@ def commit_annotations_to_tracking_json(
         if video_id is None:
             raise RuntimeError("could not read video_id from tracking json")
 
-        # Append remaining manual bboxes (those not found in original JSON)
+        # Append ALL manual bboxes（手动标注直接写入，不受 remap 影响）
         for key, bbox in manual_bbox_map.items():
             img_id, tid = key
             new_item = {

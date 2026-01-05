@@ -134,3 +134,78 @@ class AnnotationStore:
         if removed:
             self.save()
         return removed
+
+    def delete_manual_bboxes_from_frame(self, track_id: float, from_frame_idx: int) -> int:
+        """删除指定 track_id 从 from_frame_idx 开始（含）的所有 manual_bboxes"""
+        before = len(self.manual_bboxes)
+        self.manual_bboxes = [
+            b for b in self.manual_bboxes
+            if not (float(b.track_id) == float(track_id) and b.frame_idx >= from_frame_idx)
+        ]
+        removed = before - len(self.manual_bboxes)
+        if removed:
+            self.save()
+        return removed
+
+    def remap_manual_bbox_single(self, frame_idx: int, image_id: str, old_track_id: float, 
+                                  bbox_ltwh: tuple[float, float, float, float], new_track_id: float) -> bool:
+        """将指定的单个 manual_bbox 的 track_id 修改为 new_track_id"""
+        from .models import ManualBboxAnnotation
+        
+        def _close(a: float, b: float) -> bool:
+            return abs(a - b) <= 1e-3
+        
+        found = False
+        new_list: list[ManualBboxAnnotation] = []
+        for b in self.manual_bboxes:
+            if (b.frame_idx == frame_idx and 
+                b.image_id == image_id and 
+                float(b.track_id) == float(old_track_id)):
+                # 检查 bbox 是否匹配
+                bx, by, bw, bh = b.bbox_ltwh
+                tx, ty, tw, th = bbox_ltwh
+                if _close(bx, tx) and _close(by, ty) and _close(bw, tw) and _close(bh, th):
+                    # 找到匹配的，修改 track_id
+                    new_list.append(
+                        ManualBboxAnnotation(
+                            frame_idx=b.frame_idx,
+                            image_id=b.image_id,
+                            bbox_ltwh=b.bbox_ltwh,
+                            track_id=float(new_track_id),
+                        )
+                    )
+                    found = True
+                    continue
+            new_list.append(b)
+        
+        if found:
+            self.manual_bboxes = new_list
+            self.save()
+        return found
+
+    def remap_manual_bboxes_from_frame(self, old_track_id: float, new_track_id: float, from_frame_idx: int) -> int:
+        """将指定 track_id 从 from_frame_idx 开始（含）的所有 manual_bboxes 的 track_id 修改为 new_track_id"""
+        from .models import ManualBboxAnnotation
+        
+        count = 0
+        new_list: list[ManualBboxAnnotation] = []
+        for b in self.manual_bboxes:
+            if float(b.track_id) == float(old_track_id) and b.frame_idx >= from_frame_idx:
+                # 创建新的 ManualBboxAnnotation，修改 track_id
+                new_list.append(
+                    ManualBboxAnnotation(
+                        frame_idx=b.frame_idx,
+                        image_id=b.image_id,
+                        bbox_ltwh=b.bbox_ltwh,
+                        track_id=float(new_track_id),
+                    )
+                )
+                count += 1
+            else:
+                new_list.append(b)
+        
+        if count > 0:
+            self.manual_bboxes = new_list
+            self.save()
+        return count
+
