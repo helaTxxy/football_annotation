@@ -18,17 +18,46 @@ class TrackStore:
     - Builds a gzip+pickle cache for fast subsequent loads
     """
 
-    def __init__(self, tracking_json: Path, cache_path: Path):
+    def __init__(self, tracking_json: Path, cache_path: Path, force_rebuild: bool = False):
         self.tracking_json = tracking_json
         self.cache_path = cache_path
         self._by_image: dict[str, list[Detection]] | None = None
+        self._force_rebuild = force_rebuild
+
+    def invalidate_cache(self) -> None:
+        """删除缓存文件，强制下次 load 时重新从 JSON 读取"""
+        if self.cache_path.exists():
+            try:
+                self.cache_path.unlink()
+                print(f"[TrackStore] 已删除缓存: {self.cache_path.name}")
+            except Exception as e:
+                print(f"[TrackStore] 删除缓存失败: {e}")
+        self._by_image = None
+
+    def _is_cache_valid(self) -> bool:
+        """检查缓存是否有效：缓存必须存在，且修改时间严格大于源 JSON"""
+        if not self.cache_path.exists():
+            return False
+        if not self.tracking_json.exists():
+            return False
+        # 使用严格大于（>）而非大于等于（>=），确保 JSON 有任何修改都会重建缓存
+        cache_mtime = self.cache_path.stat().st_mtime
+        json_mtime = self.tracking_json.stat().st_mtime
+        # 加一个小的容差（0.1秒），避免时间戳精度问题
+        return cache_mtime > json_mtime + 0.1
 
     def load(self) -> None:
         if self._by_image is not None:
             return
-        if self.cache_path.exists() and self.cache_path.stat().st_mtime >= self.tracking_json.stat().st_mtime:
-            self._by_image = self._load_cache()
-            return
+        if not self._force_rebuild and self._is_cache_valid():
+            try:
+                self._by_image = self._load_cache()
+                print(f"[TrackStore] 从缓存加载: {self.cache_path.name}")
+                return
+            except Exception as e:
+                print(f"[TrackStore] 缓存加载失败，将重建: {e}")
+        # 重建缓存
+        print(f"[TrackStore] 从 JSON 重建: {self.tracking_json.name}")
         self._by_image = self._build_from_json_stream()
         self._save_cache(self._by_image)
 
